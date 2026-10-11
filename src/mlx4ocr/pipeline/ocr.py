@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -18,7 +19,7 @@ from mlx4ocr.models.det.model import DetectionModel
 from mlx4ocr.models.rec.model import RecognitionModel
 from mlx4ocr.output import OCRTiming
 from mlx4ocr.pipeline.config import PipelineConfig, pipeline_config_from_artifacts
-from mlx4ocr.pipeline.crop import crop_text_regions, sorted_detections
+from mlx4ocr.pipeline.crop import char_boxes_in_image, crop_text_regions, sorted_detections
 from mlx4ocr.pipeline.memory import MemoryPolicy, PipelineMemoryRuntime
 from mlx4ocr.postprocess.ctc import ctc_decode
 from mlx4ocr.postprocess.db import db_postprocess
@@ -29,7 +30,7 @@ from mlx4ocr.preprocess.det import (
     resize_det_image,
 )
 from mlx4ocr.preprocess.rec import rec_preprocess
-from mlx4ocr.types import OCRResult, TextDetection, TextRecognition
+from mlx4ocr.types import CharBox, OCRResult, TextDetection, TextRecognition
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +42,7 @@ def recognize_crops(
     rec_image_shape: tuple[int, int, int],
     characters: tuple[str, ...],
     rec_batch_num: int,
+    with_positions: bool = False,
 ) -> tuple[TextRecognition, ...]:
     """Run batched recognition on cropped text regions.
 
@@ -50,6 +52,7 @@ def recognize_crops(
         rec_image_shape: Base ``(C, H, W)`` shape from inference configs.
         characters: CTC character table with blank at index 0.
         rec_batch_num: Maximum crops per forward pass.
+        with_positions: Also record each character's position along its crop.
 
     Returns:
         Recognition results in the same order as ``crops``.
@@ -69,6 +72,15 @@ def recognize_crops(
             crop = crops[int(index)]
             max_wh_ratio = max(max_wh_ratio, crop.shape[1] / float(crop.shape[0]))
 
+        # Crops are resized to the model height and right-padded to the batch's widest
+        # crop; the share of time steps that belongs to the crop itself is this ratio.
+        padded_w = int(rec_image_shape[1] * max_wh_ratio)
+        valid_ratios = []
+        for index in batch_indices:
+            crop_h, crop_w = crops[int(index)].shape[:2]
+            resized_w = min(math.ceil(rec_image_shape[1] * crop_w / crop_h), padded_w)
+            valid_ratios.append(resized_w / padded_w)
+
         batch_tensors: list[mx.array] = []
         for index in batch_indices:
             preprocessed = rec_preprocess(
@@ -82,7 +94,11 @@ def recognize_crops(
         logits = recognizer(batch_input)
         mx.eval(logits)
         softmax = np.asarray(logits, dtype=np.float32)
-        decoded = ctc_decode(softmax, characters)
+        decoded = ctc_decode(
+            softmax,
+            characters,
+            valid_ratios=valid_ratios if with_positions else None,
+        )
         for offset, recognition in enumerate(decoded):
             original_index = int(batch_indices[offset])
             results[original_index] = recognition
@@ -233,11 +249,13 @@ class PP_OCRv6:
         """Run detection and recognition on a BGR image."""
         return self.predict(image).result
 
-    def predict(self, image: np.ndarray) -> PipelineResult:
+    def predict(self, image: np.ndarray, *, char_boxes: bool = False) -> PipelineResult:
         """Run detection and recognition and return timings.
 
         Args:
             image: Source image in BGR uint8 layout ``[H, W, 3]``.
+            char_boxes: Also fill ``OCRTextBlock.chars`` / ``char_boxes`` with each
+                character's cell in image coordinates.
 
         Returns:
             OCR output plus per-stage elapsed seconds.
@@ -307,16 +325,22 @@ class PP_OCRv6:
             rec_image_shape=self.config.rec_image_shape,
             characters=self.config.characters,
             rec_batch_num=self.config.rec_batch_num,
+            with_positions=char_boxes,
         )
         rec_s = time.perf_counter() - rec_start
 
         filtered_detections: list[TextDetection] = []
         filtered_recognitions: list[TextRecognition] = []
+        filtered_char_boxes: list[tuple[CharBox, ...]] = []
         for detection, recognition in zip(ordered, recognitions, strict=True):
             if recognition.score < self.config.drop_score:
                 continue
             filtered_detections.append(detection)
             filtered_recognitions.append(recognition)
+            if char_boxes:
+                filtered_char_boxes.append(
+                    char_boxes_in_image(detection, recognition, box_type=self.config.det_box_type)
+                )
 
         logger.info(
             "Detected %d regions, kept %d after drop_score=%.2f",
@@ -331,6 +355,7 @@ class PP_OCRv6:
                 tuple(filtered_detections),
                 tuple(filtered_recognitions),
                 model=self.variant,
+                char_boxes=tuple(filtered_char_boxes) if char_boxes else None,
             ),
             timing=OCRTiming(det_s=det_s, rec_s=rec_s, total_s=total_s),
         )

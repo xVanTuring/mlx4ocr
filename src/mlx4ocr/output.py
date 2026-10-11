@@ -135,8 +135,13 @@ def to_paddlex_res(
     input_path: str | None = None,
     page_index: int | None = None,
     text_rec_score_thresh: float = 0.0,
+    word_boxes: bool = False,
 ) -> dict[str, object]:
     """Build a PaddleOCR 3.x ``res`` dict from filtered OCR output.
+
+    With ``word_boxes`` the dict also carries PaddleX's ``text_word`` (one list of
+    characters per line) and ``text_word_boxes`` (same-shaped ``[x1, y1, x2, y2]``
+    cells); the result must have been produced with ``predict(..., char_boxes=True)``.
 
     Args:
         result: Filtered OCR output with blocks containing geometry and scores.
@@ -158,7 +163,7 @@ def to_paddlex_res(
         rec_scores.append(recognition_score)
         rec_boxes.append([box.x_min, box.y_min, box.x_max, box.y_max])
         dt_scores.append(detection_score)
-    return {
+    res: dict[str, object] = {
         "input_path": input_path,
         "page_index": page_index,
         "dt_polys": rec_polys,
@@ -169,6 +174,16 @@ def to_paddlex_res(
         "rec_boxes": rec_boxes,
         "text_rec_score_thresh": text_rec_score_thresh,
     }
+    if word_boxes:
+        for index, block in enumerate(result.blocks):
+            if "".join(block.chars) != block.text or len(block.chars) != len(block.char_boxes):
+                raise ValueError(f"OCR block {index} has no usable character boxes")
+        res["text_word"] = [list(block.chars) for block in result.blocks]
+        res["text_word_boxes"] = [
+            [[round(value, 2) for value in cell] for cell in block.char_boxes]
+            for block in result.blocks
+        ]
+    return res
 
 
 def save_to_json(

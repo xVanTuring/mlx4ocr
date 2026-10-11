@@ -58,6 +58,7 @@ def ctc_decode(
     characters: Sequence[str],
     *,
     reverse: bool = False,
+    valid_ratios: Sequence[float] | None = None,
 ) -> tuple[TextRecognition, ...]:
     """Decode CTC softmax outputs into text labels.
 
@@ -65,13 +66,21 @@ def ctc_decode(
         preds: Softmax tensor ``[B, T, num_classes]``.
         characters: Character table with blank at index 0.
         reverse: Whether to reverse mixed Arabic-like predictions.
+        valid_ratios: Per batch item, the fraction of the ``T`` time steps that
+            covers the crop (the rest is right padding). When given, each result
+            carries ``chars`` / ``char_centers`` / ``char_width`` expressed as
+            fractions of the crop's reading axis. Ignored when ``reverse`` is set,
+            because reversal breaks the char-to-position order.
 
     Returns:
         One ``TextRecognition`` per batch item.
     """
     if preds.ndim != 3:
         raise ValueError(f"expected softmax [B, T, C], got shape {preds.shape}")
+    if valid_ratios is not None and len(valid_ratios) != preds.shape[0]:
+        raise ValueError("valid_ratios must have one entry per batch item")
 
+    steps = preds.shape[1]
     indices = preds.argmax(axis=2)
     probs = preds.max(axis=2)
     results: list[TextRecognition] = []
@@ -92,5 +101,20 @@ def ctc_decode(
         text = "".join(char_list)
         if reverse:
             text = _pred_reverse(text)
-        results.append(TextRecognition(text=text, score=score))
+        if valid_ratios is None or reverse:
+            results.append(TextRecognition(text=text, score=score))
+            continue
+
+        span = steps * valid_ratios[batch_idx]
+        peaks = np.flatnonzero(selection)
+        centers = np.clip((peaks + 0.5) / span, 0.0, 1.0)
+        results.append(
+            TextRecognition(
+                text=text,
+                score=score,
+                chars=tuple(char_list),
+                char_centers=tuple(float(center) for center in centers),
+                char_width=1.0 / span,
+            )
+        )
     return tuple(results)

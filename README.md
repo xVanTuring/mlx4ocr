@@ -120,6 +120,12 @@ The Python `OCRResult` is block-based. `result.result.text` contains recognized
 lines joined with newlines, and `result.result.blocks` contains `OCRTextBlock`
 items with optional geometry and detection/recognition scores.
 
+Per-character boxes are opt-in. `predict(image, char_boxes=True)` fills each
+block's `chars` and `char_boxes` (`(x_min, y_min, x_max, y_max)` in image
+pixels, one CTC time step wide, centred on the character's peak), and
+`to_paddlex_res(result, word_boxes=True)` emits them as PaddleX
+`text_word` / `text_word_boxes`. Centres are reliable; widths are not.
+
 Optional VLM OCR API, using GLM-OCR or PaddleOCR-VL through `mlx-vlm`:
 
 ```python

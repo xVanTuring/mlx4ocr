@@ -5,7 +5,7 @@ from __future__ import annotations
 import cv2
 import numpy as np
 
-from mlx4ocr.types import TextDetection
+from mlx4ocr.types import CharBox, TextDetection, TextRecognition
 
 
 def sorted_box_indices(boxes: np.ndarray) -> np.ndarray:
@@ -54,16 +54,8 @@ def sorted_detections(detections: tuple[TextDetection, ...]) -> tuple[TextDetect
     return tuple(detections[int(index)] for index in order)
 
 
-def get_rotate_crop_image(image: np.ndarray, points: np.ndarray) -> np.ndarray:
-    """Crop and rectify a quadrilateral text region via perspective transform.
-
-    Args:
-        image: Source BGR image ``[H, W, 3]``.
-        points: Four corner points with shape ``[4, 2]``.
-
-    Returns:
-        Rectified crop in BGR layout.
-    """
+def _rect_size(points: np.ndarray) -> tuple[int, int]:
+    """Return the integer ``(width, height)`` of the rectified crop for ``points``."""
     if points.shape != (4, 2):
         raise ValueError(f"expected four corner points, got shape {points.shape}")
 
@@ -79,6 +71,51 @@ def get_rotate_crop_image(image: np.ndarray, points: np.ndarray) -> np.ndarray:
             np.linalg.norm(points[1] - points[2]),
         )
     )
+    return crop_width, crop_height
+
+
+def _is_rotated(points: np.ndarray) -> bool:
+    """Whether ``get_rotate_crop_image`` turns the crop by 90 degrees."""
+    crop_width, crop_height = _rect_size(points)
+    return crop_height / float(crop_width) >= 1.5
+
+
+def _minarea_ordered_points(points: np.ndarray) -> np.ndarray:
+    """Order the min-area rectangle of ``points`` as TL, TR, BR, BL."""
+    bounding_box = cv2.minAreaRect(points.astype(np.int32))
+    corner_points = sorted(cv2.boxPoints(bounding_box), key=lambda item: item[0])
+
+    if corner_points[1][1] > corner_points[0][1]:
+        index_a, index_d = 0, 1
+    else:
+        index_a, index_d = 1, 0
+    if corner_points[3][1] > corner_points[2][1]:
+        index_b, index_c = 2, 3
+    else:
+        index_b, index_c = 3, 2
+
+    return np.array(
+        [
+            corner_points[index_a],
+            corner_points[index_b],
+            corner_points[index_c],
+            corner_points[index_d],
+        ],
+        dtype=np.float32,
+    )
+
+
+def get_rotate_crop_image(image: np.ndarray, points: np.ndarray) -> np.ndarray:
+    """Crop and rectify a quadrilateral text region via perspective transform.
+
+    Args:
+        image: Source BGR image ``[H, W, 3]``.
+        points: Four corner points with shape ``[4, 2]``.
+
+    Returns:
+        Rectified crop in BGR layout.
+    """
+    crop_width, crop_height = _rect_size(points)
     pts_std = np.float32(
         [
             [0, 0],
@@ -95,8 +132,7 @@ def get_rotate_crop_image(image: np.ndarray, points: np.ndarray) -> np.ndarray:
         borderMode=cv2.BORDER_REPLICATE,
         flags=cv2.INTER_CUBIC,
     )
-    crop_height, crop_width = crop.shape[:2]
-    if crop_height / float(crop_width) >= 1.5:
+    if _is_rotated(points):
         crop = np.rot90(crop)
     return crop
 
@@ -111,28 +147,7 @@ def get_minarea_rect_crop(image: np.ndarray, points: np.ndarray) -> np.ndarray:
     Returns:
         Rectified crop in BGR layout.
     """
-    bounding_box = cv2.minAreaRect(points.astype(np.int32))
-    corner_points = sorted(cv2.boxPoints(bounding_box), key=lambda item: item[0])
-
-    if corner_points[1][1] > corner_points[0][1]:
-        index_a, index_d = 0, 1
-    else:
-        index_a, index_d = 1, 0
-    if corner_points[3][1] > corner_points[2][1]:
-        index_b, index_c = 2, 3
-    else:
-        index_b, index_c = 3, 2
-
-    ordered = np.array(
-        [
-            corner_points[index_a],
-            corner_points[index_b],
-            corner_points[index_c],
-            corner_points[index_d],
-        ],
-        dtype=np.float32,
-    )
-    return get_rotate_crop_image(image, ordered)
+    return get_rotate_crop_image(image, _minarea_ordered_points(points))
 
 
 def crop_text_regions(
@@ -162,3 +177,51 @@ def crop_text_regions(
         else:
             crops.append(get_minarea_rect_crop(image, points))
     return tuple(crops)
+
+
+def char_boxes_in_image(
+    detection: TextDetection,
+    recognition: TextRecognition,
+    *,
+    box_type: str = "quad",
+) -> tuple[CharBox, ...]:
+    """Map CTC character cells from crop space back to image coordinates.
+
+    Each cell is one CTC time step wide, centred on the character's peak, and
+    spans the full height of the detected region. Rotated crops (see
+    ``get_rotate_crop_image``) read along the box's left-to-right edge pair
+    instead of its top-to-bottom one.
+
+    Args:
+        detection: Detection the recognition was cropped from.
+        recognition: Recognition decoded with ``valid_ratios``.
+        box_type: Same crop mode that produced the recognition crop.
+
+    Returns:
+        One ``(x_min, y_min, x_max, y_max)`` box per ``recognition.chars`` entry.
+    """
+    points = np.array(detection.box.points, dtype=np.float32)
+    if box_type == "poly":
+        points = _minarea_ordered_points(points)
+    top_left, top_right, bottom_right, bottom_left = points
+    if _is_rotated(points):
+        start_a, end_a, start_b, end_b = top_left, bottom_left, top_right, bottom_right
+    else:
+        start_a, end_a, start_b, end_b = top_left, top_right, bottom_left, bottom_right
+
+    half = recognition.char_width / 2.0
+    boxes: list[CharBox] = []
+    for center in recognition.char_centers:
+        lo, hi = max(0.0, center - half), min(1.0, center + half)
+        corners = np.array(
+            [
+                start_a + lo * (end_a - start_a),
+                start_a + hi * (end_a - start_a),
+                start_b + hi * (end_b - start_b),
+                start_b + lo * (end_b - start_b),
+            ]
+        )
+        x_min, y_min = corners.min(axis=0)
+        x_max, y_max = corners.max(axis=0)
+        boxes.append((float(x_min), float(y_min), float(x_max), float(y_max)))
+    return tuple(boxes)

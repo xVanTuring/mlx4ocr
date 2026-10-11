@@ -58,7 +58,11 @@ def download_pretrained_rec(
 
     url = pretrained_rec_url(variant)
     logger.info("Downloading Paddle pretrained recognition weights from %s", url)
-    urllib.request.urlretrieve(url, destination)
+    # Download beside the target and rename, so an interrupted download never leaves a
+    # truncated checkpoint that later loads would trip over.
+    partial = destination.with_name(destination.name + ".part")
+    urllib.request.urlretrieve(url, partial)
+    partial.replace(destination)
     if not destination.is_file():
         raise FileNotFoundError(f"failed to download pretrained checkpoint: {destination}")
     return destination
